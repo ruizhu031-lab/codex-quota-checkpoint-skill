@@ -1,0 +1,6 @@
+interface:
+  display_name: "Quota Checkpoint / 额度续接"
+  short_description: "Manual-start quota monitoring and durable project pause/resume"
+  default_prompt: "Use $quota-checkpoint to start monitoring this project; check every 15 active minutes above 50%, save on stop, and resume with the original scope and quality."
+policy:
+  allow_implicit_invocation: false
