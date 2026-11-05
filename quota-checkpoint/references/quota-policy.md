@@ -49,30 +49,33 @@
 示例时间只供说明结构；实际运行用当前时间和工具返回值。工具外层若有 MCP `content` 文本或 JSON-RPC `result`，先提取实际额度 JSON；脚本也支持这些常见包装。
 
 ```text
-python <skill-dir>/scripts/assess.py <observation.json> --unit-minutes 5
-python <skill-dir>/scripts/assess.py <observation.json> --previous <last-decision.json> --unit-minutes 3 --heavy
-python <skill-dir>/scripts/assess.py <observation.json> --resuming --unit-minutes 5
+python <skill-dir>/scripts/assess.py <observation.json> --control <task-dir>/control.json --unit-minutes 5 --save-minutes 2
+python <skill-dir>/scripts/assess.py <observation.json> --control <task-dir>/control.json --previous <last-decision.json> --unit-minutes 3 --save-minutes 1 --heavy
+python <skill-dir>/scripts/assess.py <observation.json> --control <task-dir>/control.json --stop-requested --unit-minutes 5 --save-minutes 2
 ```
 
 多桶时重复 `--limit-id <已确认适用桶>`。`--pause-floor 5 --decision-at 10` 为本技能当前默认值；只有用户另行要求时才改变这两个数。旧的 `--reserve-short`、`--reserve-long` 已移除，避免把保留值与决策区间混淆。
 
 完整输出 JSON 留在任务进度目录，用作下一次的 `--previous`；向模型只回传必要摘要。输出仅保留预算所需字段，账户 ID 只派生为短摘要用于比较同账户，原 ID 不输出。输入原始响应不应进入版本控制，保存后删除不再需要的原始响应文件。
 
-脚本返回 `continue`、`pause` 或 `unknown`；这三种正常决策都以进程退出码 0 返回，调用方必须读取 JSON 的 `action`。输入文件或参数错误以非零退出。`continue` 仅代表保守预算门槛通过，不代表整个项目或下一个长请求有成功保证。
+脚本输出 schemaVersion 2，返回 `continue`、`finish_then_pause`、`pause` 或 `unknown`；正常决策均退出 0，必须读取 JSON 的 `action`。输入错误非零退出。`finish_then_pause` 只允许已绑定的当前环节收尾，不能选择下一环节；`unknown` 在工作流中转换为保存暂停。预算估计不是完成保证。
+
+`--unit-minutes` 是当前环节剩余工作及必要验证的实际估算，不是期限。`--save-minutes` 覆盖尚欠的技术记录、总结、保存与核对，没有默认值；停止区间缺任一估算就暂停。`--control` 读取持久化 phase、pause_pending 和当前环节 ID；无控制文件时可用 `--current-unit-id`、`--pause-pending`。`--stop-requested` 在任何额度下评估停止；`--hard-stop` 和 `--phase paused/completed` 不使用读数，输出暂停且没有下次查询时间。普通高额度巡检可以不带环节估算。
 
 计算方法：
 
 - 读数必须不超过 120 秒；比较样本间隔为 1–30 分钟，且账户摘要、`runKey`、模型设置标记、窗口长度和重置时刻一致。
 - 同窗口已用量增加时，`rate = 增量百分点 / 间隔分钟`。整数读数未变时可沿用最近 10 分钟内的正速率；下降、重置或设置改变时丢弃旧速率。没有可信速率就用初始估算，不把零增量当免费。
 - 初始单元预算：普通短/长窗口分别 2/0.5 个百分点（以 5 分钟为基准），高消耗分别 3/1 个百分点（以 3 分钟为基准），随单元时长缩放。这是进入决策区间后的启发式预算，尚无长期消耗实测保证。
-- 有可信速率时，普通用 2 倍、高消耗用 3 倍速率估算；最小单元预算普通短/长为 0.5/0.25、高消耗为 1/0.5 个百分点。保存开销至少 0.25 个百分点，有速率时至少覆盖约 1 分钟。恢复额外开销普通至少 0.5、高消耗至少 1 个百分点，有速率时同样至少覆盖约 1 分钟；实际恢复更大时计入完整预算，不降低后续工作标准；监测已开启且到期时再取新读数。
-- **高于 10%：预算预测只指导提前保存与完整环节成本判断，不产生主动暂停。** 若计划环节消耗较大，只提示提前保存并保留全部范围、深度和必要验证，不强制缩小环节、降低标准或限定几分钟完成。估算时长没有 30 分钟上限。
-- **高于 5%、不超过 10%：** 只有 `remaining > 5 + unit_cost + save_cost + resume_cost` 才继续一个单元，否则暂停；分别检查每个适用窗口。**不超过 5%：** 直接保存并暂停。服务端限额和未知状态仍优先处理。
-- 仅在用户明确开启监测后：所有适用窗口最低剩余高于50%每15分钟、高于25%至50%每10分钟、高于10%至25%每5分钟、高于5%至10%每3分钟复查；高消耗模式不自动提高频率。以连续主动工作及最近可执行边界为准，不以每个环节为一次查询。
+- 有可信速率时，普通用 2 倍、高消耗用 3 倍速率估算；最小单元预算普通短/长为 0.5/0.25、高消耗为 1/0.5 个百分点。保存预算为同一保守每分钟速率乘实际保存分钟数，至少 0.25 个百分点；无实测速率时采用上述初始每分钟估算。`--resuming` 加入当次恢复成本，普通至少 0.5、高消耗至少 1 个百分点，有速率时至少覆盖约 1 分钟。实际更大的恢复成本另计入剩余工作估算，不降低标准。
+- **高于 10% 且没有待暂停要求：** 成本预测只指导提前保存，不因环节大主动暂停或缩水。估算时长没有 30 分钟上限。
+- **任一窗口高于 5%、不超过 10%，或已有停止请求：** 锁定当前环节，只有每一个适用窗口均满足 `remaining > 5 + unit_cost + save_cost + resume_cost`，且当前环节和估算完整，才返回 `finish_then_pause`。预算包含其他高于 10% 的窗口，不只检查低值窗口。相等视为不足。不足则 `pause`；无已开始环节不能新开一个。**不超过 5%：** 保存暂停。
+- `pausePending` 一旦出现就写入控制状态；每次评估都读取控制状态，额度恢复不能取消它。完成该环节后转换 paused；只有明确继续才清除。服务端禁止和未知状态优先保存。
+- 仅在启用后：最低剩余高于50%每20分钟，高于20%至50%每15分钟，高于10%至20%每5分钟，高于5%至10%仅在收尾期间每3分钟。正式暂停后没有下一次查询；高消耗模式不改变周期。
 
 ## 资料与实际验证范围
 
-制作时查阅日期：2026-11-02。以下为可维护来源，未来工具与字段变化时优先实际工具声明。
+额度字段初次核查日期：2026-11-02；本轮行为更新：2026-11-05。以下为可维护来源，未来工具与字段变化时优先实际工具声明。
 
 - [OpenAI：App Server 的额度读取与字段](https://learn.chatgpt.com/docs/app-server)：确认 JSON-RPC 读取、多个额度桶、已用百分比和 Unix 秒时间。
 - [OpenAI：Codex 额度与任务消耗](https://learn.chatgpt.com/docs/pricing)：消耗受模型、上下文、推理和任务复杂程度影响，不能固定换算分钟数。

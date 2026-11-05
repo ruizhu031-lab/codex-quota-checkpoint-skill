@@ -1,169 +1,167 @@
-# Codex 额度监测与断点续接 Skill
+# Codex 额度监测、完整技术记录与项目续接技能
 
-**手动开启额度监测，停止时保存真实进度，继续时依据原始要求和验证证据恢复完整项目。**
+**主动调用后自动监测额度，持续保存工作细节，暂停或上下文压缩后按原范围与标准继续。**
 
-[English](README.md) · [技能入口](quota-checkpoint/SKILL.md) · [额度规则](quota-checkpoint/references/quota-policy.md) · [检查点格式](quota-checkpoint/references/checkpoint.md)
+[English](README.md) · [技能规则](quota-checkpoint/SKILL.md) · [额度计算](quota-checkpoint/references/quota-policy.md) · [完整恢复流程](quota-checkpoint/references/recovery.md)
 
-仓库名：`codex-quota-checkpoint-skill`；安装目录和调用名：`quota-checkpoint` / `$quota-checkpoint`。
+[![Tests](https://github.com/ruizhu031-lab/codex-quota-checkpoint-skill/actions/workflows/tests.yml/badge.svg)](https://github.com/ruizhu031-lab/codex-quota-checkpoint-skill/actions/workflows/tests.yml) [![MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-适合 Codex 大型项目、长时间任务、可能跨额度窗口的工作，以及需要主动“停止保存 / 继续恢复”的场景。项目再大、工作再久、模型再昂贵，都不会自行开启监测。
+`quota-checkpoint` 用于大型、长时间 Codex 项目。只有你主动调用后，它才监测额度，同时持续记录原始要求、工程细节、重要决定、验证证据与准确断点。它不会因为项目大、工作久、模型贵或发现旧检查点而自动启动。
 
-这是 **Codex 工作流程技能 + 本地 Python 辅助脚本**，不是后台定时器、计费客户端或硬性限额拦截器。Python 脚本不获取真实账户额度；实时读数依赖宿主已经提供的只读工具，缺少工具时不能凭空推测。
+完整交付范围、技术深度、模型与推理设置、必要验证和验收标准始终保留。项目或某个环节太大时，额度不够就记录并等待，不能通过缩水、降低标准或用草稿替代成品完成。
 
-## 功能概览
-
-| 功能 | 具体行为 |
-| --- | --- |
-| 明确启动 | `allow_implicit_invocation: false`，关闭自动发现；首次显式调用后才处理操作命令 |
-| 低频监测 | 额度高于 50% 时，每连续主动工作 15 分钟复查；低额度时再收紧 |
-| 额度不足暂停 | 进入 5%–10% 判断下一完整环节是否够用，到 5% 保存并暂停 |
-| 用户主动停止 | 不论是否开启监测、额度多少，优先保存，不先查额度或继续推进功能 |
-| 版本化交接 | 保存原始要求、关键决策、证据、待办、下一步、产物指纹和可用的 Git 现场 |
-| 核对后续接 | 先检查真实文件、用户新改动、运行任务和外部副作用，再继续原完整计划 |
-| 保留原范围和质量 | 不因项目或环节大而减功能、降深度、降低模型/推理强度或跳过必要验证 |
+这是技能指令与本地 Python 辅助工具的组合。额度检查由 agent 在工作边界调用宿主只读工具完成，脚本不登录账户、不读取凭据、不自行联网查额度，也不是后台定时服务。可选恢复钩子只处理明确绑定的项目会话。
 
 ## 安装
 
-需要支持本地文件技能的 Codex 环境。辅助脚本需要 Python 3.10+；Git 可选。实时监测还需要宿主可用的额度读取工具；**没有实时额度工具仍可使用停止保存和项目恢复流程**。
+需要支持本地技能和显式调用的 Codex 环境，以及 Python 3.10+。Git 可选；实时监测需要宿主提供受支持的只读额度工具。缺少额度工具时仍可直接保存现场，但不能保证预算足够完成收尾。
 
-### 通过 Codex 安装
-
-在提供 `$skill-installer` 的 Codex 环境中输入：
+可以对带有安装器的 Codex 说：
 
 ```text
-使用 $skill-installer 安装这个仓库中的 quota-checkpoint 技能：
+使用 $skill-installer 安装这个仓库中的 quota-checkpoint：
 https://github.com/ruizhu031-lab/codex-quota-checkpoint-skill/tree/main/quota-checkpoint
 ```
 
-### 手动安装
+也可以克隆/下载仓库，只复制包含 `SKILL.md` 与 `agents/openai.yaml` 的 `quota-checkpoint` 文件夹。官方文档列出个人 `~/.agents/skills` 和项目 `.agents/skills`；部分桌面版本/安装器使用 `$CODEX_HOME/skills` 或 `~/.codex/skills`，以实际发现目录为准，避免装两份。已有版本先备份、比较后更新，不盲目覆盖。
 
-克隆或下载本仓库，将完整的 **`quota-checkpoint` 文件夹**复制到宿主支持的技能目录，保留 `agents/openai.yaml` 和目录名。
+[英文说明](README.md#manual-installation)提供 Windows、macOS/Linux 复制命令。安装后可新开会话或重启让技能重新发现。**安装不启动监测，也不会给项目注册钩子。**
 
-当前官方文档列出个人目录 `~/.agents/skills` 和项目目录 `.agents/skills`。部分桌面版本或内置安装器使用 `$CODEX_HOME/skills` / `~/.codex/skills`；以实际宿主支持的位置为准，避免安装重复副本。
+## 如何调用
 
-Windows PowerShell 示例：
-
-```powershell
-git clone https://github.com/ruizhu031-lab/codex-quota-checkpoint-skill.git
-$skillDestination = Join-Path $env:USERPROFILE '.agents\skills\quota-checkpoint'
-if (Test-Path -LiteralPath $skillDestination) {
-    throw '目标已存在，请先检查旧版本，不要直接覆盖。'
-}
-New-Item -ItemType Directory -Path (Split-Path -Parent $skillDestination) -Force | Out-Null
-Copy-Item -LiteralPath '.\codex-quota-checkpoint-skill\quota-checkpoint' -Destination $skillDestination -Recurse
-```
-
-macOS / Linux 的复制示例见 [English README](README.md#manual-installation)。若未显示技能，开始新会话或重启 Codex。安装完成不代表开启监测，仍须明确调用。具体规则见 [OpenAI 官方技能文档](https://learn.chatgpt.com/docs/build-skills)。
-
-## 命令用法
-
-### 开启本项目额度监测
+启动当前项目：
 
 ```text
-使用 $quota-checkpoint，开始自动监测当前项目额度。
-保持原模型、推理强度、完整交付范围和验收标准。
+$quota-checkpoint
 ```
 
-启用时取得一次基线，保存本项目授权状态，之后按周期检查。不会注册系统服务或定时自动化，不会把授权传播到其他项目。
+这会自动开启监测、取得一次真实额度基线、创建或续写详细技术文档，并准备本项目的恢复索引/钩子。保存任务、授权、实际会话绑定及当前完整环节的验收要求。
 
-### 只停止保存，不开启监测
+普通停止：
 
 ```text
-使用 $quota-checkpoint 停止工作并保存进度，不查询额度，不开启监测。
+停止工作，保存进度。
 ```
 
-技能已加载的同一项目会话中，可以直接说“停止工作”“暂停项目，保存进度”。新聊天未加载技能时，仅说“停止工作”不能保证宿主会加载本技能，因此首次应带 `$quota-checkpoint`。
+立即进入停止流程：先记录当前断点和待暂停状态，再估算当前已经开始的环节还需多少工作、必要验证、技术记录更新、最终总结和保存成本。每个适用窗口保留 5% 底线，足够就只完成这个环节后暂停；不足、未知或没有正在做的环节则直接保存暂停。不能开始下一环节，额度中途恢复也不取消停止要求。
 
-停止命令优先于额度判断；在宿主能够处理指令的第一个边界停止推进。不会先做一轮查询、继续修一个问题或开启新测试。未做验证明确保留为未验证，恢复后补齐。
-
-### 继续工作
+需要立刻保存而不继续当前环节时：
 
 ```text
-使用 $quota-checkpoint，从 <检查点目录> 恢复项目。
-核对真实文件和原始资料，继续全部待办和必要验证，保持原要求与质量。
+不要继续当前环节，立即保存暂停，不查询额度。
 ```
 
-“继续”不新增监测授权；只恢复此前明确开启且未关闭的监测。旧进度没有授权状态时默认关闭。重新核对用户改动和外部副作用，避免覆盖新工作或重复部署、发送、提交等操作。
-
-### 关闭监测但继续项目
+恢复：
 
 ```text
-关闭本项目额度监测，项目工作继续。
+使用 $quota-checkpoint，从 <检查点目录> 继续工作。
+先核对完整原始要求、相关技术记录原文及验证证据，再推进。
 ```
 
-### 只讨论技能，不运行
+技能先核对现场、用户新修改、原决定、准确断点、全部待办、测试证据、运行任务和外部操作，填写具体恢复记录。此前监测开启且未关闭时，在推进前重新读额度。预计重置时间、打开聊天或上下文压缩都不等于用户说“继续”。
+
+其他命令：
 
 ```text
-检查或修改 quota-checkpoint 技能。本次不要执行监测、停止或恢复流程。
+关闭额度监测，但继续工作并维护技术记录。
+检查或修改 quota-checkpoint，本次不要执行它。
 ```
 
-讨论、举例、引用命令以及否定指令，均不当作项目操作命令。
+关闭监测不取消已经收到的停止要求。示例、引用、否定和技能修改不会执行监测。新聊天要显式带 `$quota-checkpoint` 并指出任务；单独说“停止工作”不保证宿主加载显式技能。
 
-## 检查频率与暂停阈值
+## 监测频率
 
-取当前模型**已确认适用窗口中最低的剩余百分比**，不硬编码账户永远只有某两个窗口：
+使用所有**已确认适用窗口**中的最低剩余百分比：
 
-| 最低剩余额度 | 连续主动工作后的复查周期 |
+| 剩余额度 | 主动工作后的复查周期 |
 | --- | --- |
-| 高于 50% | 15 分钟 |
-| 高于 25%、不超过 50% | 10 分钟 |
-| 高于 10%、不超过 25% | 5 分钟 |
-| 高于 5%、不超过 10% | 3 分钟 |
+| 高于 50% | 20 分钟 |
+| 高于 20%、不超过 50% | 15 分钟 |
+| 高于 10%、不超过 20% | 5 分钟 |
+| 高于 5%、不超过 10% | 只允许当前环节收尾，期间每 3 分钟 |
 | 不超过 5% | 保存并暂停 |
 
-暂停、等待用户、纯下载或外部构建等待不计入主动工作。检查到期后在最近可执行边界进行，不保证中断一次长推理或工具调用。高消耗模式只扩大估算余量，不擅自加密为每分钟查询。用户主动要求、实际限额错误或明确更改模型/速度/并发设置时，可以额外复查一次。
+边界明确：50% 用 15 分钟，20% 用 5 分钟，10% 进入收尾评估，5% 直接保存。主动时间不包含等用户、暂停和纯外部构建/下载等待；到期在最近可执行边界检查，不能保证打断一个长推理或不可中断工具调用。
 
-- **高于 10%：** 继续原完整工作；预算估计只提示提前保存，不能变成缩水或升高暂停阈值的理由。
-- **高于 5%、不超过 10%：** 判断下一完整环节、保存及必要恢复开销是否足够，同时保留 5% 底线；不够则保存暂停，不能通过少做内容把“不够”变成“够”。
-- **不超过 5%：** 保存并暂停，不开新环节。
-- **服务端限额或额度未知：** 先保存并说明缺失项，不伪造余额、不无限重试。到重置时间不等于已经恢复。
+高于 10% 且没有停止要求时，继续完整工作；大环节可以提前保存，不能因此提前提高暂停门槛或缩水。进入区间或收到普通停止命令后，评估**当前环节**，不是新开下一个。每个窗口都须足够支付剩余工作和保存成本并保留 5%；相等视为不足，估算或环节身份不明也保存。
 
-账户读数可能包含其他会话消耗，预测不是对当前项目的精确归因。预算、倍数和时间间隔是可解释的默认策略，不能保证一次长请求必定够用。阈值可以由使用者明确调整。
+正式暂停后没有每 3 分钟轮询，没有自动复工。等待用户明确继续。高消耗模式只增加估算余量，不降低模型，也不加快查询。明确要求立即查询、实际限额错误或刻意变更模型/速度/并发可额外读取一次。
 
-## 保存内容与恢复质量
+额度是账户共享观测，可能含其他聊天消耗；预测为保守估计，不能准确换算“还能工作几分钟”，也不是 OpenAI 的完成保证。不消费额外点数、不买额度、不兑换重置券、不换账户。
 
-交接保存全部原始目标与验收标准、已完成和待办、关键决策和依据、否定方案、原始资料、验证命令及结果、准确下一步、模型配置、运行任务和外部副作用。
+## 完整技术文档保存什么
 
-项目进度目录通常为：
+从启用开始持续记录：
+
+- 原始目标、最新要求、全部交付物与验收重点。
+- 工作步骤、重要修改、文件/接口/参数、准确断点和所有待办。
+- 设计决定、依据和原始资料、否定方案及原因。
+- 命令、结果、失败与解决过程、通过/失败/未验证证据。
+- 当前环节完成条件、模型/推理设置、下一步、运行任务和外部副作用。
+
+重要结果及时追加，有未记录进展时最迟约 5 分钟主动工作后的可执行边界补写。完整检查点按里程碑、暂停前及约 15 分钟主动工作更新；保存不附带查额度。
+
+任务目录 `.codex-progress/<task>/` 中的 `TECHNICAL_LOG.md` 是完整技术文档；原文同时保存在有指纹链的 `journal/` 条目中。新摘要不替代旧细节，更正采用追加记录。同一事件重复提交相同正文不会重复写入，改写已有事件会被拒绝。
+
+Markdown 视图损坏时，可从校验通过的原始链重建全部正文；原始链损坏会明确报告，不凭摘要补造。长输出保存为本地证据并引用，恢复时按需读原文。agent 负责持续记录有意义的工程信息，脚本不会自动捕获所有工具输出或整段聊天。
+
+检查点包含 state、HANDOFF、manifest 和已有控制状态副本，保存要求、决定、待办、文件指纹、Git 现场及对应技术日志链头。**它不是项目源码或进程内存的备份。**实际工作文件也须保留，迁移时带走整个进度目录和真实项目文件。
+
+## 上下文压缩后如何找回细节
+
+三层保护：
+
+1. 详细原文落盘保留，不能因为压缩对话而删减或用摘要覆盖。
+2. 项目 `AGENTS.md` 增加有标记边界的恢复索引，保留已有内容；索引不授权其他会话监测或自动恢复。
+3. 支持的宿主上配置项目级 `PreCompact` 与 `SessionStart(compact/resume)` 钩子，匹配明确绑定的真实会话。
+
+压缩前钩子核验已有记录并标记需要恢复核对；压缩后在下一次模型请求前重新提供文档位置和读取要求。钩子只做短暂本地操作，不查询额度、不调用新模型、不自行复工，也不能替 agent 写出尚未落盘的工程结论。日志内容不会被直接提升为 developer 指令。
+
+新建或改过的钩子必须在 **Settings > Hooks** 或 **`/hooks`** 中审阅并信任，可能还需重载会话。配置工具只报告待信任，不改信任数据库、不绕过审批。缺少会话 ID 或宿主不支持时使用文档与索引，并说明增强钩子未生效。`AGENTS.override.md` 遮蔽索引或已有 inline Hooks 时，必须明确处理，不能假装已接入。
+
+压缩后即使聊天摘要看起来够用，也先核对完整要求、关键决定、当前环节、断点、待办、验证证据、实际文件及外部操作。缺失或矛盾先找原始依据，找不回则明确说明，不能猜测推进。原本收尾仍只完成原环节再暂停；原本暂停仍等你说继续。
+
+**能保护已经保存的详细原文，并建立强制恢复流程；不能承诺文档全文永久驻留模型上下文、挽回从未保存的信息、保证每个宿主都执行钩子，或证明压缩前后模型理解和输出完全一致。**完整范围与质量要求不会因此降低。[恢复机制与命令](quota-checkpoint/references/recovery.md)说明了实际边界。
+
+## 辅助命令与旧版本兼容
 
 ```text
-.codex-progress/<task-id>/
-├── control.json       # 由代理按规则维护：监测授权、计时及最近命令
-├── LATEST
-└── <version>/
-    ├── state.json
-    ├── HANDOFF.md
-    └── manifest.json  # 文件SHA-256和可用的Git现场
+python <skill-dir>/scripts/assess.py <observation.json> --control <task-dir>/control.json --unit-minutes 8 --save-minutes 2
+python <skill-dir>/scripts/checkpoint.py append <event.md> --event-id <unique-id> --root <project> --task <task-id>
+python <skill-dir>/scripts/checkpoint.py save <state.json> --root <project> --task <task-id>
+python <skill-dir>/scripts/checkpoint.py verify --root <project> --task <task-id>
+python <skill-dir>/scripts/workflow.py recover --root <project> --task <task-id>
 ```
 
-辅助脚本先发布完整版本，再替换 `LATEST`；写入或发布失败时尽量保留旧检查点。核验能报告文件变化或缺失，不覆盖用户改动。`control.json` 由代理依据参考格式单独维护，脚本不是状态守护进程。
+`--unit-minutes` 是剩余完整工作及必要验证的估算，不是限时；`--save-minutes` 包括技术记录、总结和保存。缺估算不擅自猜默认值。assess 输出版本 2，结果为 continue、finish_then_pause、pause、unknown；正常判断退出码均为 0，**必须读取 JSON action**。
 
-**检查点不是项目文件备份或进程内存快照。** 实际文件也必须落盘；换机器、换目录时应同时带走项目文件与进度目录。不会自动提交 Git、推送或上传用户项目。原模型不可用或确实需要改变范围时由用户选择，不静默降级。恢复质量依赖原始资料和可验证现场，不能承诺与未中断运行完全等价。
+工作流持久保存环节与待暂停状态，禁止停止期间选择其他环节；明确恢复前要求针对当前指纹填写具体核对记录。文件变动让旧确认失效。指纹证明文件状态，不能证明 agent 已理解全部事实。
 
-## 脚本、隐私与验证
+旧检查点保持可读；明确迁移会保留旧版本、写入已知历史并标明缺口，不能把旧摘要缺失的细节说成已经找回。配置生成保留原规则和其他钩子，运行配置含本机 Python/脚本路径，移动安装位置后应重新生成、审阅。
 
-`scripts/assess.py`：从已有新鲜读数计算 `continue` / `pause` / `unknown` 与下次周期，不联网获取额度。正常决策均以退出码 0 返回，必须读取 JSON 中的 `action`；输入错误返回非零退出码。`--unit-minutes` 是成本估算，不是强制截止时间。
+## 额度开销、隐私与限制
 
-`scripts/checkpoint.py`：保存版本化交接、计算关键产物指纹、记录只读 Git 现场，并在恢复时核验。输入格式及命令见 [额度参考](quota-checkpoint/references/quota-policy.md) 和 [检查点参考](quota-checkpoint/references/checkpoint.md)。
+- 文档增量记录和恢复重读会消耗一定额度；本地渲染、校验和钩子不额外调用模型。没有固定开销比例保证，通过局部追加和按需读取控制成本。
+- 记录、证据及原始额度数据默认在本地，不自动提交或上传。提交项目时审查进度目录；技能不会擅自改项目 `.gitignore`。
+- 不读取密钥、Cookie、凭据或整份环境变量，不保存隐藏思维链，不安装私有额度接口。
+- 长调用、额度突发耗尽、进程/磁盘故障、权限、钩子超时均可能影响及时保存。失败和未验证能力必须如实报告。
+- 只协调本项目可控制的任务，不自动停止其他项目或聊天。
+- 这是独立开源技能，不是 OpenAI 官方额度保障服务。
 
-不读取 `auth.json`、Cookie、API Key 或私有计费接口，不购买额度、不使用重置券、不切换账户。进度和完整额度观测默认留在本地；提交项目之前请检查交接记录是否包含私密内容。技能不会擅自修改用户项目的 `.gitignore`。
-
-在仓库根目录运行：
+## 测试与贡献
 
 ```text
 python -B -X utf8 -m unittest discover -s quota-checkpoint/tests -v
 ```
 
-51 项测试方法覆盖额度、多窗口、过期数据、取整、模型变化、频率边界、文件核验、保存失败及范围保留标志。使用模拟数据和隔离文件，不读取真实账户额度；没有 Git 时会跳过一项 Git 专用测试。GitHub Actions 配置 Linux / Windows 测试。
+测试使用模拟额度和隔离目录，覆盖阈值、所有窗口预算、停止状态持久化、大环节不缩水、文档成本、原文保留、写入失败、指纹、旧版迁移、用户改动、钩子会话隔离与配置合并，以及无聊天摘要的新进程恢复。CI 覆盖 Linux/Windows × Python 3.10/3.13。Git 不可用时跳过相应测试。
 
-这些测试不等于真实的自然语言触发验证、额度耗尽实测、精确定时保证或恢复质量等价实验。该项目与 OpenAI 无隶属关系，不是官方插件。
+模拟事件和文件测试不是实际宿主压缩、自然语言执行或模型质量完全相同的证明。实际钩子信任和事件触发需在目标宿主验证，不混报结果。参见[贡献说明](CONTRIBUTING.md)。
 
-## 参与与许可
+## 开源许可与资料
 
-改动或提交问题前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。不要在公开 Issue 中贴出真实账户 ID、原始额度响应、令牌或私人项目交接记录。
+采用 [MIT](LICENSE)，Copyright 2026 ruizhu031-lab，允许依许可复用、修改、分发和商用；本项目与 OpenAI 无隶属关系。
 
-采用 [MIT License](LICENSE)，版权归 2026 ruizhu031-lab。允许使用、修改、分发和商用，须保留版权和许可声明。
+[官方技能文档](https://learn.chatgpt.com/docs/build-skills)、[额度协议](https://learn.chatgpt.com/docs/app-server)、[额度说明](https://learn.chatgpt.com/docs/pricing)、[Hooks](https://learn.chatgpt.com/docs/hooks)、[AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)、[上下文压缩机制](https://openai.com/index/unrolling-the-codex-agent-loop/)。
 
-相关资料：[官方技能机制](https://learn.chatgpt.com/docs/build-skills)、[官方 App Server 额度协议](https://learn.chatgpt.com/docs/app-server)、[官方额度与消耗说明](https://learn.chatgpt.com/docs/pricing)。
-
-关键词：Codex skill / agent skills / quota monitoring / usage limits / rate limits / checkpoint / pause resume / context preservation / 额度监测 / 断点保存 / 暂停继续 / 项目续接。
+检索关键词：Codex skill、agent skills、quota monitoring、rate limits、checkpoint、pause resume、technical work log、context compaction、context recovery、context preservation；Codex 技能、额度监测、断点续接、技术记录、上下文压缩恢复。

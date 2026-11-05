@@ -7,5 +7,6 @@ venv/
 Thumbs.db
 .codex-progress/
 quota-checkpoint-test-*/
+.test-temp-*/
 .env
 .env.*

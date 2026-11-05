@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decide one bounded unit from an already-fetched Codex usage observation.
+"""Budget a complete existing unit from an already-fetched Codex usage observation.
 
 No network, credentials, billing operations, or background polling.
 All normal decisions exit 0; inspect the JSON action field.
@@ -20,9 +20,9 @@ def number(value):
 
 def cadence_minutes(remaining):
     if remaining > 50:
+        return 20
+    if remaining > 20:
         return 15
-    if remaining > 25:
-        return 10
     if remaining > 10:
         return 5
     return 3
@@ -60,18 +60,33 @@ def unwrap(value):
     raise ValueError("Usage wrapper nesting is unsupported")
 
 
-def assess(observation, previous=None, *, unit_minutes=5, heavy=False,
+def assess(observation, previous=None, *, unit_minutes=None, save_minutes=None,
+           current_unit_id=None, stop_requested=False, pause_pending=False,
+           hard_stop=False, phase="working", heavy=False,
            resuming=False, limit_ids=None, pause_floor=5, decision_at=10, now=None):
-    if not number(unit_minutes) or unit_minutes <= 0:
+    if unit_minutes is not None and (not number(unit_minutes) or unit_minutes <= 0):
         raise ValueError("unit_minutes must be a finite positive estimate; it is not a time limit")
+    if save_minutes is not None and (not number(save_minutes) or save_minutes <= 0):
+        raise ValueError("save_minutes must cover documentation, summary and durable saving")
+    if current_unit_id is not None and (not isinstance(current_unit_id, str) or not current_unit_id.strip()):
+        raise ValueError("current_unit_id must identify the already-started unit")
+    if phase not in {"working", "finishing", "paused", "completed"}:
+        raise ValueError("Invalid workflow phase")
     if not number(pause_floor) or not number(decision_at) or not 0 <= pause_floor < decision_at <= 100:
         raise ValueError("Thresholds must satisfy 0 <= pause_floor < decision_at <= 100")
     now = time.time() if now is None else now
-    output = {"schemaVersion": 1, "action": "unknown", "reasons": [], "warnings": [],
+    pending = bool(stop_requested or pause_pending or phase == "finishing")
+    output = {"schemaVersion": 2, "action": "unknown", "reasons": [], "warnings": [],
               "nextCheckMinutes": None, "emergency": False, "budgets": [],
               "pauseFloorPercent": pause_floor, "decisionAtPercent": decision_at,
-              "checkpointBeforeNextUnit": False, "preserveFullScopeAndQuality": True}
+              "checkpointBeforeNextUnit": False, "preserveFullScopeAndQuality": True,
+              "pausePending": pending, "currentUnitId": current_unit_id,
+              "pauseReason": "user" if stop_requested else ("pending" if pending else None)}
     reasons, warnings = output["reasons"], output["warnings"]
+    if hard_stop or phase in {"paused", "completed"}:
+        output.update(action="pause", pausePending=True, pauseReason="user" if hard_stop else phase)
+        reasons.append("Save without advancing; a paused task has no polling interval")
+        return output
     if not isinstance(observation, dict):
         reasons.append("Observation must be an object")
         return output
@@ -136,9 +151,11 @@ def assess(observation, previous=None, *, unit_minutes=5, heavy=False,
     prior_windows = prior.get("windows", [])
     if not isinstance(prior_windows, list):
         prior_windows = []
-    next_check = 15
+    next_check = 20
     pause = False
     unknown_window = False
+    exact_budgets = []
+    estimates_complete = bool(current_unit_id and unit_minutes is not None and save_minutes is not None)
     for key in selected:
         bucket = buckets[key]
         if not isinstance(bucket, dict):
@@ -197,19 +214,26 @@ def assess(observation, previous=None, *, unit_minutes=5, heavy=False,
             margin = 3 if heavy else 2
             initial = (1 if heavy else 0.5) if long_window else (3 if heavy else 2)
             minimum = (0.5 if heavy else 0.25) if long_window else (1 if heavy else 0.5)
-            cost = max(minimum, margin * rate * unit_minutes) if rate is not None else max(minimum, initial * unit_minutes / (3 if heavy else 5))
-            save_cost = max(0.25, margin * rate) if rate is not None else 0.25
+            per_minute = margin * rate if rate is not None else initial / (3 if heavy else 5)
+            cost = max(minimum, per_minute * unit_minutes) if unit_minutes is not None else None
+            save_cost = max(0.25, per_minute * save_minutes) if save_minutes is not None else None
             resume_cost = 0
             if resuming:
                 resume_cost = max(1 if heavy else 0.5, margin * rate if rate is not None else 0)
-            threshold = pause_floor + cost + save_cost + resume_cost
-            headroom = remaining - threshold
+            threshold = pause_floor + cost + save_cost + resume_cost if cost is not None and save_cost is not None else None
+            headroom = remaining - threshold if threshold is not None else None
+            exact_budgets.append((remaining, threshold))
             in_band = remaining <= decision_at
+            if in_band:
+                pending = True
+                output["pausePending"] = True
+                if output["pauseReason"] is None:
+                    output["pauseReason"] = "quota"
             output["budgets"].append({
                 "limitId": key, "lane": lane, "remainingPercent": round(remaining, 3),
-                "reservePoints": pause_floor, "unitCostPoints": round(cost, 3),
-                "saveCostPoints": round(save_cost, 3), "resumeCostPoints": round(resume_cost, 3),
-                "requiredPoints": round(threshold, 3), "ratePointsPerMinute": rate,
+                "reservePoints": pause_floor, "unitCostPoints": round(cost, 3) if cost is not None else None,
+                "saveCostPoints": round(save_cost, 3) if save_cost is not None else None, "resumeCostPoints": round(resume_cost, 3),
+                "requiredPoints": round(threshold, 3) if threshold is not None else None, "ratePointsPerMinute": rate,
                 "estimate": rate_basis, "decisionBand": in_band, "resetsAt": reset,
             })
             if remaining <= pause_floor:
@@ -217,34 +241,50 @@ def assess(observation, previous=None, *, unit_minutes=5, heavy=False,
                 output["checkpointBeforeNextUnit"] = True
                 pause = True
                 reasons.append(f"{label}: {remaining:.2f}% remaining has reached the {pause_floor:g}% saving floor")
-            elif in_band and headroom <= 0:
-                output["checkpointBeforeNextUnit"] = True
-                pause = True
-                reasons.append(f"{label}: inside {pause_floor:g}-{decision_at:g}% band; {remaining:.2f}% cannot cover {threshold:.2f} budget points")
             next_check = min(next_check, cadence_minutes(remaining))
             if in_band:
                 output["checkpointBeforeNextUnit"] = True
-            if headroom <= 0 and not in_band:
+            if headroom is not None and headroom <= 0 and not in_band:
                 output["checkpointBeforeNextUnit"] = True
                 warnings.append(f"{label}: save before the complete planned unit; preserve its scope, depth and verification requirements")
         if not readable:
             unknown_window = True
             reasons.append(f"{key}: no measurable quota window")
+    # Once any applicable window requests stopping, budget against EVERY window,
+    # including windows above 10%. A reset cannot cancel a latched stop request.
+    if pending:
+        output["checkpointBeforeNextUnit"] = True
+        if not estimates_complete:
+            pause = True
+            reasons.append("No identified unfinished unit or evidence-based remaining-work/save estimate; save now")
+        elif any(remaining <= required or math.isclose(remaining, required, rel_tol=0, abs_tol=1e-9)
+                 for remaining, required in exact_budgets):
+            pause = True
+            reasons.append("Current unit plus verification, documentation and saving cannot preserve every window's floor")
     if pause:
         output["action"] = "pause"
+        output["pausePending"] = True
     elif not unknown_window and permission is True and output["budgets"]:
-        output["action"] = "continue"
+        output["action"] = "finish_then_pause" if pending else "continue"
         output["nextCheckMinutes"] = next_check
-        reasons.append("No measured applicable window requires a pause under the configured decision band")
+        reasons.append("Finish only the identified current unit, then save and pause" if pending else "Continue the complete original task")
     return output
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("observation", type=Path)
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--limit-id", action="append", dest="limit_ids")
-    parser.add_argument("--unit-minutes", type=float, default=5)
+    parser.add_argument("--unit-minutes", type=float)
+    parser.add_argument("--save-minutes", type=float)
+    parser.add_argument("--current-unit-id")
+    parser.add_argument("--stop-requested", action="store_true")
+    parser.add_argument("--pause-pending", action="store_true")
+    parser.add_argument("--hard-stop", action="store_true")
+    parser.add_argument("--phase", choices=("working", "finishing", "paused", "completed"), default="working")
+    parser.add_argument("--control", type=Path, help="Read persisted phase/current unit/pending stop; never modifies it")
     parser.add_argument("--heavy", action="store_true")
     parser.add_argument("--resuming", action="store_true")
     parser.add_argument("--pause-floor", type=float, default=5)
@@ -253,10 +293,21 @@ def main():
     try:
         observation = json.loads(args.observation.read_text(encoding="utf-8-sig"))
         previous = json.loads(args.previous.read_text(encoding="utf-8-sig")) if args.previous else None
+        if args.control:
+            control = json.loads(args.control.read_text(encoding="utf-8-sig"))
+            args.phase = control["phase"]
+            args.pause_pending = args.pause_pending or control["pause_pending"]
+            bound_id = (control.get("current_unit") or {}).get("id")
+            if args.current_unit_id and args.current_unit_id != bound_id:
+                raise ValueError("Current unit differs from the persisted workflow")
+            args.current_unit_id = bound_id
         result = assess(observation, previous, unit_minutes=args.unit_minutes, heavy=args.heavy,
+                        save_minutes=args.save_minutes, current_unit_id=args.current_unit_id,
+                        stop_requested=args.stop_requested, pause_pending=args.pause_pending,
+                        hard_stop=args.hard_stop, phase=args.phase,
                         resuming=args.resuming, limit_ids=args.limit_ids,
                         pause_floor=args.pause_floor, decision_at=args.decision_at)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"action": "unknown", "error": str(exc)}, ensure_ascii=False))
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))

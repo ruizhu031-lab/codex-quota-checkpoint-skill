@@ -46,6 +46,7 @@ def bucket(value):
 
 class PolicyTests(unittest.TestCase):
     def decide(self, value=None, **options):
+        options = {"current_unit_id": "fixture-unit", "unit_minutes": 5, "save_minutes": 1, **options}
         return policy.assess(value if value is not None else observation(), now=options.pop("now", NOW), **options)
 
     def test_healthy_usage_and_zero_paid_balance(self):
@@ -145,10 +146,10 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(self.decide(observation(usage=wrapper))["action"], "continue")
 
     def test_heavy_and_recovery_modes_preserve_more_margin(self):
-        self.assertEqual(self.decide(observation(93), unit_minutes=3)["action"], "continue")
+        self.assertEqual(self.decide(observation(93), unit_minutes=3)["action"], "finish_then_pause")
         self.assertEqual(self.decide(observation(93), unit_minutes=3, heavy=True)["action"], "pause")
-        self.assertEqual(self.decide(observation(91), unit_minutes=3, heavy=True)["action"], "continue")
-        self.assertEqual(self.decide(observation(91), unit_minutes=3, heavy=True, resuming=True)["action"], "pause")
+        self.assertEqual(self.decide(observation(90), unit_minutes=3, heavy=True)["action"], "finish_then_pause")
+        self.assertEqual(self.decide(observation(90), unit_minutes=3, heavy=True, resuming=True)["action"], "pause")
 
     def test_unknown_model_defaults_to_heavy_mode(self):
         result = self.decide(observation(92, modelKey="unknown"), unit_minutes=3)
@@ -216,7 +217,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_exact_ten_percent_is_a_decision_instead_of_automatic_pause(self):
         result = self.decide(observation(90))
-        self.assertEqual(result["action"], "continue")
+        self.assertEqual(result["action"], "finish_then_pause")
         self.assertTrue(result["budgets"][0]["decisionBand"])
         self.assertTrue(result["checkpointBeforeNextUnit"])
 
@@ -235,8 +236,8 @@ class PolicyTests(unittest.TestCase):
         first = self.decide(observation(91, observedAt=NOW-300), now=NOW-300, heavy=True, unit_minutes=3)
         second = self.decide(observation(92), previous=first, heavy=True, unit_minutes=3)
         third = self.decide(observation(92, observedAt=NOW+180), previous=second, now=NOW+180, heavy=True, unit_minutes=3)
-        self.assertEqual(second["action"], "continue")
-        self.assertEqual(third["action"], "continue")
+        self.assertEqual(second["action"], "finish_then_pause")
+        self.assertEqual(third["action"], "finish_then_pause")
         self.assertEqual(third["budgets"][0]["estimate"], "recent-positive-rate")
         self.assertEqual(second["budgets"][0]["unitCostPoints"], third["budgets"][0]["unitCostPoints"])
 
@@ -245,7 +246,7 @@ class PolicyTests(unittest.TestCase):
         result = self.decide(observation(92, modelKey="unknown"), previous=first, unit_minutes=3)
         self.assertEqual(result["mode"], "heavy")
         self.assertAlmostEqual(result["budgets"][0]["ratePointsPerMinute"], 0.2)
-        self.assertEqual(result["action"], "continue")
+        self.assertEqual(result["action"], "finish_then_pause")
 
     def test_recent_rate_hint_expires_without_fresh_positive_usage(self):
         first = self.decide(observation(91, observedAt=NOW-300), now=NOW-300, heavy=True, unit_minutes=3)
@@ -259,23 +260,23 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(result["budgets"][0]["ratePointsPerMinute"])
 
     def test_higher_quota_checks_are_less_frequent_than_critical_band(self):
-        self.assertEqual(self.decide(observation(20))["nextCheckMinutes"], 15)
-        self.assertEqual(self.decide(observation(20), heavy=True, unit_minutes=3)["nextCheckMinutes"], 15)
+        self.assertEqual(self.decide(observation(20))["nextCheckMinutes"], 20)
+        self.assertEqual(self.decide(observation(20), heavy=True, unit_minutes=3)["nextCheckMinutes"], 20)
         self.assertEqual(self.decide(observation(92))["nextCheckMinutes"], 3)
 
     def test_frequency_boundaries_and_lowest_window(self):
-        for remaining, minutes in ((51,15),(50,10),(26,10),(25,5),(11,5),(10,3)):
+        for remaining, minutes in ((51,20),(50,15),(21,15),(20,5),(11,5),(10,3)):
             for heavy in (False,True):
                 result = self.decide(observation(100-remaining), heavy=heavy, unit_minutes=0.25)
                 self.assertEqual(result["nextCheckMinutes"], minutes)
-        self.assertEqual(self.decide(observation(0,60))["nextCheckMinutes"],10)
+        self.assertEqual(self.decide(observation(0,60))["nextCheckMinutes"],15)
 
     def test_large_complete_unit_is_not_time_capped_or_shrunk(self):
         result = self.decide(observation(20),unit_minutes=120,heavy=True)
         self.assertEqual(result["action"],"continue")
         self.assertTrue(result["preserveFullScopeAndQuality"])
         self.assertNotIn("suggestedUnitMinutes",result)
-        self.assertEqual(result["nextCheckMinutes"],15)
+        self.assertEqual(result["nextCheckMinutes"],20)
 
 
 def state():
