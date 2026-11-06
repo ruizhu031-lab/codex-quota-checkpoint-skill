@@ -179,9 +179,31 @@ def render_journal(task, entries):
     return "".join(parts).encode("utf-8")
 
 
-def verify_journal(root, task, head=None, check_view=True):
+def latest_journal_head(root, task):
+    directory = task_directory(root, task)
+    pointer = inside(root, directory / "LATEST")
+    if not pointer.exists():
+        return None
+    version = pointer.read_text(encoding="utf-8").strip()
+    if not VERSION.fullmatch(version):
+        raise ValueError("LATEST is not a valid local checkpoint version name")
+    manifest = json.loads(inside(root, directory / version / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1 or manifest.get("task") != task:
+        raise ValueError("Checkpoint manifest schema or task ID is invalid")
+    if "journal" not in manifest:
+        return None  # Legacy checkpoints may predate the detailed journal.
+    journal = manifest["journal"]
+    if not isinstance(journal, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(journal.get("head", ""))):
+        raise ValueError("Saved journal anchor is invalid")
+    return journal["head"]
+
+
+def verify_journal(root, task, head=None, check_view=True, required_ancestor=None):
     root = Path(root).resolve(strict=True)
     head, entries = journal_entries(root, task, head)
+    if (required_ancestor is not None and head != required_ancestor
+            and not any(entry["previous"] == required_ancestor for entry in entries)):
+        raise ValueError("Journal rolled back or diverged from the saved checkpoint; restore the missing original chain")
     data = render_journal(task, entries)
     path = inside(root, task_directory(root, task) / "TECHNICAL_LOG.md")
     if check_view and (not path.is_file() or path.read_bytes() != data):
@@ -192,44 +214,55 @@ def verify_journal(root, task, head=None, check_view=True):
 
 def append_journal(root, task, event_id, text):
     root = Path(root).resolve(strict=True)
+    with task_lock(task_directory(root, task)):
+        return _append_journal(root, task, event_id, text)
+
+
+def _append_journal(root, task, event_id, text):
+    """Append while the caller holds the task writer lock."""
     directory = task_directory(root, task)
     if not isinstance(event_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,95}", event_id):
         raise ValueError("Event ID must contain 1-96 lowercase letters, digits, or hyphens")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Journal entry must contain actual engineering facts")
-    with task_lock(directory):
-        pointer = inside(root, directory / "JOURNAL_HEAD")
-        head, entries = journal_entries(root, task) if pointer.exists() else ("", [])
-        if head:
-            verify_journal(root, task)
-        for old in entries:
-            if old["id"] == event_id:
-                if old["text"] != text:
-                    raise ValueError("An existing event cannot be rewritten; append a correction with a new ID")
-                atomic_write(inside(root, directory / "TECHNICAL_LOG.md"), render_journal(task, entries))
-                return {"saved": True, "duplicate": True, **verify_journal(root, task)}
-        entry = {"schemaVersion": 1, "task": task, "id": event_id, "sequence": len(entries) + 1,
-                 "createdAt": datetime.now(timezone.utc).isoformat(), "previous": head, "text": text}
-        data = json_bytes(entry)
-        digest = hashlib.sha256(data).hexdigest()
-        journal = inside(root, directory / "journal")
-        journal.mkdir(exist_ok=True)
-        file = inside(root, journal / (digest + ".json"))
-        if file.exists() and file.read_bytes() != data:
-            raise ValueError("Existing immutable journal entry is corrupted")
-        if not file.exists():
-            atomic_write(file, data)
-        # The immutable entry is durable before publishing the head. A failed view
-        # update can be repaired from this chain without losing any original text.
-        atomic_write(pointer, (digest + "\n").encode("ascii"))
-        atomic_write(inside(root, directory / "TECHNICAL_LOG.md"), render_journal(task, entries + [entry]))
-        return {"saved": True, "duplicate": False, **verify_journal(root, task)}
+    pointer = inside(root, directory / "JOURNAL_HEAD")
+    journal = inside(root, directory / "journal")
+    anchor = latest_journal_head(root, task)
+    if not pointer.exists() and (anchor is not None
+            or inside(root, directory / "TECHNICAL_LOG.md").exists()
+            or (journal.exists() and any(journal.iterdir()))):
+        raise ValueError("Existing technical records have no JOURNAL_HEAD; preserve them and recover the original history before appending")
+    head, entries = journal_entries(root, task) if pointer.exists() else ("", [])
+    if head:
+        verify_journal(root, task, required_ancestor=anchor)
+    for old in entries:
+        if old["id"] == event_id:
+            if old["text"] != text:
+                raise ValueError("An existing event cannot be rewritten; append a correction with a new ID")
+            atomic_write(inside(root, directory / "TECHNICAL_LOG.md"), render_journal(task, entries))
+            return {"saved": True, "duplicate": True, **verify_journal(root, task)}
+    entry = {"schemaVersion": 1, "task": task, "id": event_id, "sequence": len(entries) + 1,
+             "createdAt": datetime.now(timezone.utc).isoformat(), "previous": head, "text": text}
+    data = json_bytes(entry)
+    digest = hashlib.sha256(data).hexdigest()
+    journal.mkdir(exist_ok=True)
+    file = inside(root, journal / (digest + ".json"))
+    if file.exists() and file.read_bytes() != data:
+        raise ValueError("Existing immutable journal entry is corrupted")
+    if not file.exists():
+        atomic_write(file, data)
+    # The immutable entry is durable before publishing the head. A failed view
+    # update can be repaired from this chain without losing any original text.
+    atomic_write(pointer, (digest + "\n").encode("ascii"))
+    atomic_write(inside(root, directory / "TECHNICAL_LOG.md"), render_journal(task, entries + [entry]))
+    return {"saved": True, "duplicate": False, **verify_journal(root, task)}
 
 
 def rebuild_journal(root, task):
     root = Path(root).resolve(strict=True)
     directory = task_directory(root, task)
     with task_lock(directory):
+        verify_journal(root, task, check_view=False, required_ancestor=latest_journal_head(root, task))
         _, entries = journal_entries(root, task)
         path = inside(root, directory / "TECHNICAL_LOG.md")
         data = render_journal(task, entries)
@@ -291,8 +324,9 @@ def _save_checkpoint(root, task, state):
                 "handoffSha256": hashlib.sha256(handoff_data).hexdigest()}
     directory = task_directory(root, task)
     directory.mkdir(parents=True, exist_ok=True)
-    if inside(root, directory / "JOURNAL_HEAD").exists():
-        manifest["journal"] = verify_journal(root, task)
+    anchor = latest_journal_head(root, task)
+    if inside(root, directory / "JOURNAL_HEAD").exists() or anchor is not None:
+        manifest["journal"] = verify_journal(root, task, required_ancestor=anchor)
     control_file = inside(root, directory / "control.json")
     control_data = control_file.read_bytes() if control_file.exists() else None
     if control_data is not None:
@@ -345,7 +379,7 @@ def verify_checkpoint(root, task):
     if "journal" in manifest:
         try:
             old = verify_journal(root, task, manifest["journal"]["head"], check_view=False)
-            current = verify_journal(root, task)
+            current = verify_journal(root, task, required_ancestor=old["head"])
             if old["textSha256"] != manifest["journal"]["textSha256"]:
                 raise ValueError("Saved journal fingerprint differs")
             journal_status = {"available": True, "intact": True,

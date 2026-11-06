@@ -43,7 +43,7 @@ python <skill-dir>/scripts/checkpoint.py save <state.json> --root <项目根目�
 python <skill-dir>/scripts/checkpoint.py verify --root <项目根目录> --task <本任务标识>
 ```
 
-读取 `HANDOFF.md`，确认目标与下一步没有遗失，检查 `integrity_ok`、`changed`、`missing` 及 `journal`。完整性覆盖交接包、保存的控制状态和已有技术记录链；实际项目文件变化另列。`journal.advanced` 表示记录已追加，不代表旧历史损坏。都核对后才报告已保存。检查点不是项目文件备份；迁移需带走实际工作文件与整个进度目录（含不可变 journal），不能只带 Markdown 摘要。
+读取 `HANDOFF.md`，确认目标与下一步没有遗失，检查 `integrity_ok`、`changed`、`missing` 及 `journal`。完整性覆盖交接包、保存的控制状态和已有技术记录链；实际项目文件变化另列。只有当前链完整包含已保存的链头，`journal.advanced` 才表示正常追加；回退或分叉会判为完整性失败，也不能靠另存检查点掩盖。都核对后才报告已保存。检查点不是项目文件备份；迁移需带走实际工作文件与整个进度目录（含不可变 journal），不能只带 Markdown 摘要。
 
 脚本识别到关键文件在哈希计算期间变化会中止发布。保存后仍可能有其他进程继续修改文件；要记录运行任务，续接时重新核对。磁盘不可写、文件缺失、路径越界、包不完整时保留错误并报告，不能把失败说成成功。
 

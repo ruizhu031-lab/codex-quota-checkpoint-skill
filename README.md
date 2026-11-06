@@ -210,6 +210,8 @@ python <skill-dir>/scripts/workflow.py recover --root <project> --task <task-id>
 
 The workflow persists the current unit and pending stop, refuses a different unit during stopping, and requires factual recovery notes against a fingerprint before explicit resume. Fingerprints catch changed evidence; they cannot prove that an agent understood every fact. Legacy checkpoints remain readable; explicit migration preserves old versions and labels missing history rather than inventing it.
 
+Recovery checks reject journal rollback or divergent history, and refuse to overwrite an existing technical log when its journal head is missing. An acknowledgement is bound to the evidence actually reviewed: changes during confirmation require another review. Failed first-checkpoint initialization can be retried with the same inputs, while project advancement remains blocked until it succeeds. Completed tasks no longer conflict with a later task explicitly started in the same chat. See the [recovery procedure](quota-checkpoint/references/recovery.md) for failure handling.
+
 Hook setup is a separate project operation during explicit activation, not an installation side effect. It backs up and preserves existing guidance and unrelated hooks. Runtime config contains machine-specific Python/script paths: regenerate it after moving the skill or changing machines. No helper automatically uploads project records or commits/pushes changes.
 
 ## Privacy, cost and limits
@@ -227,7 +229,7 @@ Hook setup is a separate project operation during explicit activation, not an in
 python -B -X utf8 -m unittest discover -s quota-checkpoint/tests -v
 ```
 
-The suite uses synthetic quota data and disposable project directories. It tests thresholds, all-window budgets, stop persistence, full-size units, documentation cost, append-only history, failed writes, checksums, legacy migration, user edits, scoped hooks, preserving existing config and reconstructing task details in a fresh process without a chat summary. CI covers Linux/Windows and Python 3.10/3.13. A Git-specific test is skipped if Git is unavailable.
+The suite uses synthetic quota data and disposable project directories. It tests thresholds, all-window budgets, stop persistence, full-size units, documentation cost, append-only history, rollback/divergence detection, preservation of existing logs, initialization retries, edits and interruptions during recovery acknowledgement, checksums, legacy migration, scoped hooks, completed-task isolation, preserving existing config and reconstructing task details in a fresh process without a chat summary. CI covers Linux/Windows and Python 3.10/3.13. Git- or symlink-dependent tests are skipped when the required host capability is unavailable.
 
 These are deterministic and simulated lifecycle tests, not proof of actual host compaction delivery, natural-language compliance, quota-exhaustion survival or equal model quality. Actual hook trust and event delivery must be verified in the intended host. See [CONTRIBUTING.md](CONTRIBUTING.md).
 

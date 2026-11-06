@@ -130,6 +130,67 @@ class DurableFixture(unittest.TestCase):
 
 
 class JournalTests(DurableFixture):
+    def test_existing_plain_technical_log_is_never_overwritten_on_start(self):
+        self.directory().mkdir(parents=True)
+        path = self.directory() / "TECHNICAL_LOG.md"
+        original = b"Earlier requirements and unsummarized implementation details.\n"
+        path.write_bytes(original)
+        with self.assertRaises(ValueError):
+            self.activate()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((self.directory() / "LATEST").exists())
+
+    def test_missing_journal_head_does_not_start_a_replacement_history(self):
+        self.activate()
+        entries = {p.name: p.read_bytes() for p in (self.directory() / "journal").iterdir()}
+        (self.directory() / "JOURNAL_HEAD").unlink()
+        (self.directory() / "TECHNICAL_LOG.md").unlink()
+        with self.assertRaises(ValueError):
+            self.append()
+        self.assertEqual(entries, {p.name: p.read_bytes() for p in (self.directory() / "journal").iterdir()})
+        self.assertFalse((self.directory() / "JOURNAL_HEAD").exists())
+
+    def rollback_saved_detail(self):
+        self.activate()
+        head = (self.directory() / "JOURNAL_HEAD").read_bytes()
+        view = (self.directory() / "TECHNICAL_LOG.md").read_bytes()
+        self.append("required-detail", "The required page size is 37; never discard this detail.")
+        cp.save_checkpoint(self.root, self.task, state())
+        (self.directory() / "JOURNAL_HEAD").write_bytes(head)
+        (self.directory() / "TECHNICAL_LOG.md").write_bytes(view)
+
+    def test_rolled_back_journal_blocks_recovery(self):
+        self.rollback_saved_detail()
+        report = cp.verify_checkpoint(self.root, self.task)
+        self.assertFalse(report["integrity_ok"])
+        self.assertFalse(report["journal"]["intact"])
+        with self.assertRaises(ValueError):
+            wf.recovery_report(self.root, self.task)
+
+    def test_save_append_and_rebuild_cannot_hide_a_journal_rollback(self):
+        self.rollback_saved_detail()
+        before = {name: (self.directory() / name).read_bytes()
+                  for name in ("LATEST", "JOURNAL_HEAD", "TECHNICAL_LOG.md")}
+        for operation in (lambda: cp.save_checkpoint(self.root, self.task, state()),
+                          lambda: self.append("new-detail", "A newer fact cannot hide missing history"),
+                          lambda: cp.rebuild_journal(self.root, self.task)):
+            with self.subTest(operation=operation), self.assertRaises(ValueError):
+                operation()
+        self.assertEqual(before, {name: (self.directory() / name).read_bytes() for name in before})
+
+    def test_divergent_valid_chain_is_not_reported_as_an_append(self):
+        self.activate()
+        baseline = {name: (self.directory() / name).read_bytes() for name in ("JOURNAL_HEAD", "TECHNICAL_LOG.md")}
+        self.append("branch-a", "First branch: required retry policy")
+        branch_a = {name: (self.directory() / name).read_bytes() for name in baseline}
+        for name, data in baseline.items():
+            (self.directory() / name).write_bytes(data)
+        self.append("branch-b", "Different branch: incompatible evidence")
+        cp.save_checkpoint(self.root, self.task, state())
+        for name, data in branch_a.items():
+            (self.directory() / name).write_bytes(data)
+        self.assertFalse(cp.verify_checkpoint(self.root, self.task)["integrity_ok"])
+
     def test_user_document_edits_are_preserved_before_any_rebuild(self):
         self.activate()
         path = self.directory() / "TECHNICAL_LOG.md"
@@ -253,6 +314,145 @@ class JournalTests(DurableFixture):
 
 
 class WorkflowTests(DurableFixture):
+    def test_first_checkpoint_failure_can_retry_without_losing_baseline(self):
+        real = cp.write_synced
+        def fail_checkpoint(path, data):
+            if path.name == "state.json":
+                raise OSError("fixture initial checkpoint disk failure")
+            return real(path, data)
+        with mock.patch.object(cp, "write_synced", side_effect=fail_checkpoint), self.assertRaises(OSError):
+            self.activate()
+        self.assertFalse((self.directory() / "LATEST").exists())
+        with self.assertRaises(ValueError):
+            self.bind_unit()
+        result = self.activate()
+        self.assertTrue(result["baseline_reading_required"])
+        self.assertTrue(cp.verify_checkpoint(self.root, self.task)["integrity_ok"])
+        self.assertEqual(cp.verify_journal(self.root, self.task)["entryCount"], 1)
+        self.assertIn(self.baseline, (self.directory() / "TECHNICAL_LOG.md").read_text(encoding="utf-8"))
+
+    def test_failed_initialization_rejects_changed_retry_inputs(self):
+        real = cp.write_synced
+        def fail_checkpoint(path, data):
+            if path.name == "state.json":
+                raise OSError("fixture initial save failure")
+            return real(path, data)
+        with mock.patch.object(cp, "write_synced", side_effect=fail_checkpoint), self.assertRaises(OSError):
+            self.activate()
+        changed = dict(state(), requirements=["A shorter replacement scope"])
+        with self.assertRaises(ValueError):
+            wf.start(self.root, self.task, self.session, "Explicit synthetic activation", changed, self.baseline)
+        self.activate()
+        self.assertEqual(wf.recovery_report(self.root, self.task)["state"]["requirements"], state()["requirements"])
+
+    def test_interrupted_initialization_cleanup_is_retryable(self):
+        real = Path.unlink
+        def fail_cleanup(path, *args, **kwargs):
+            if path.name == "INITIALIZING.json":
+                raise OSError("fixture interruption after checkpoint publication")
+            return real(path, *args, **kwargs)
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_cleanup), self.assertRaises(OSError):
+            self.activate()
+        with self.assertRaises(ValueError):
+            wf.read_control(self.root, self.task)
+        result = self.activate()
+        self.assertTrue(result["baseline_reading_required"])
+        self.assertFalse((self.directory() / "INITIALIZING.json").exists())
+        self.assertTrue(cp.verify_checkpoint(self.root, self.task)["integrity_ok"])
+
+    def test_initial_save_failure_retries_without_a_host_session_id(self):
+        real = cp.write_synced
+        def fail_checkpoint(path, data):
+            if path.name == "state.json":
+                raise OSError("fixture initial save failure")
+            return real(path, data)
+        with mock.patch.object(cp, "write_synced", side_effect=fail_checkpoint), self.assertRaises(OSError):
+            wf.start(self.root, self.task, None, "Explicit synthetic activation", state(), self.baseline)
+        result = wf.start(self.root, self.task, None, "Explicit synthetic activation", state(), self.baseline)
+        self.assertTrue(result["baseline_reading_required"])
+        self.assertIsNone(result["control"]["session_id"])
+
+    def test_edit_during_recovery_receipt_write_requires_a_new_review(self):
+        self.activate()
+        wf.transition(self.root, self.task, "pause")
+        review = self.review()
+        real = cp.atomic_write
+        def edit_during_ack(path, data):
+            result = real(path, data)
+            if path.name == "RECOVERY_ACK.json":
+                (self.root / "project.txt").write_text("Unreviewed user change during acknowledgement", encoding="utf-8")
+            return result
+        with mock.patch.object(cp, "atomic_write", side_effect=edit_during_ack), self.assertRaises(ValueError):
+            wf.acknowledge(self.root, self.task, review)
+        self.assertTrue(wf.read_control(self.root, self.task)["recovery_required"])
+        self.assertFalse((self.directory() / "RECOVERY_ACK.json").exists())
+        with self.assertRaises((ValueError, OSError)):
+            wf.resume(self.root, self.task, self.session, "continue")
+        self.assertIn("Unreviewed user change", (self.root / "project.txt").read_text(encoding="utf-8"))
+        wf.acknowledge(self.root, self.task, self.review())
+        self.assertEqual(wf.resume(self.root, self.task, self.session, "continue")["control"]["phase"], "working")
+
+    def test_recovery_receipt_write_failure_keeps_recovery_gate_closed(self):
+        self.activate()
+        hook.handle(self.event())
+        review = self.review()
+        real = cp.atomic_write
+        def fail_receipt(path, data):
+            if path.name == "RECOVERY_ACK.json":
+                raise OSError("fixture recovery receipt write failure")
+            return real(path, data)
+        with mock.patch.object(cp, "atomic_write", side_effect=fail_receipt), self.assertRaises(OSError):
+            wf.acknowledge(self.root, self.task, review)
+        self.assertTrue(wf.read_control(self.root, self.task)["recovery_required"])
+        with self.assertRaises(ValueError):
+            self.bind_unit()
+
+    def test_interruption_before_receipt_publication_does_not_unlock_work(self):
+        self.activate()
+        hook.handle(self.event())
+        review = self.review()
+        real = cp.atomic_write
+        def interrupt_receipt(path, data):
+            if path.name == "RECOVERY_ACK.json":
+                raise KeyboardInterrupt("fixture abrupt acknowledgement interruption")
+            return real(path, data)
+        with mock.patch.object(cp, "atomic_write", side_effect=interrupt_receipt), self.assertRaises(KeyboardInterrupt):
+            wf.acknowledge(self.root, self.task, review)
+        self.assertTrue(wf.read_control(self.root, self.task)["recovery_required"])
+        with self.assertRaises(ValueError):
+            self.bind_unit()
+        wf.acknowledge(self.root, self.task, self.review())
+        self.assertFalse(wf.read_control(self.root, self.task)["recovery_required"])
+
+    def test_recovery_gate_publication_failure_invalidates_receipt(self):
+        self.activate()
+        hook.handle(self.event())
+        review = self.review()
+        real = cp.atomic_write
+        def fail_unlock(path, data):
+            if path.name == "control.json" and json.loads(data).get("recovery_required") is False:
+                raise OSError("fixture final control write failure")
+            return real(path, data)
+        with mock.patch.object(cp, "atomic_write", side_effect=fail_unlock), self.assertRaises(OSError):
+            wf.acknowledge(self.root, self.task, review)
+        self.assertTrue(wf.read_control(self.root, self.task)["recovery_required"])
+        self.assertFalse((self.directory() / "RECOVERY_ACK.json").exists())
+
+    def test_edit_during_review_log_append_is_not_blessed_by_a_new_fingerprint(self):
+        self.activate()
+        wf.transition(self.root, self.task, "pause")
+        review = self.review()
+        real = cp.atomic_write
+        def edit_after_log(path, data):
+            result = real(path, data)
+            if path.name == "TECHNICAL_LOG.md":
+                (self.root / "project.txt").write_text("Unreviewed version 2", encoding="utf-8")
+            return result
+        with mock.patch.object(cp, "atomic_write", side_effect=edit_after_log), self.assertRaises(ValueError):
+            wf.acknowledge(self.root, self.task, review)
+        self.assertFalse((self.directory() / "RECOVERY_ACK.json").exists())
+        self.assertTrue(wf.read_control(self.root, self.task)["recovery_required"])
+
     def test_completion_requires_no_unfinished_unit_and_real_evidence(self):
         self.activate()
         self.bind_unit()
@@ -396,6 +596,17 @@ class WorkflowTests(DurableFixture):
 
 
 class HookTests(DurableFixture):
+    def test_completed_task_does_not_block_a_new_task_in_the_same_session(self):
+        self.activate()
+        wf.transition(self.root, self.task, "complete", {"evidence": "Original fixture acceptance verified"})
+        old_control = (self.directory() / "control.json").read_bytes()
+        wf.start(self.root, "next-task", self.session, "Explicit next task", state(), "New complete task baseline")
+        for event in (self.event("PreCompact"), self.event()):
+            result = hook.handle(event)
+            self.assertNotEqual(result, {})
+        self.assertEqual((self.directory() / "control.json").read_bytes(), old_control)
+        self.assertTrue(wf.read_control(self.root, "next-task")["recovery_required"])
+
     def test_unavailable_session_identity_keeps_basic_records_without_hook_binding(self):
         wf.start(self.root, self.task, None, "explicit activation", state(), self.baseline)
         result = wf.setup_recovery(self.root, self.task)

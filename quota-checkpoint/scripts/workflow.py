@@ -33,6 +33,8 @@ def task_path(root, task, name):
 
 
 def read_control(root, task):
+    if task_path(root, task, "INITIALIZING.json").exists():
+        raise ValueError("Task initialization is incomplete; retry the original start command before advancing")
     value = json.loads(task_path(root, task, "control.json").read_text(encoding="utf-8"))
     if (not isinstance(value, dict) or value.get("schemaVersion") != 2 or value.get("task") != task
             or value.get("phase") not in PHASES or type(value.get("monitoring_enabled")) is not bool
@@ -63,15 +65,8 @@ def start(root, task, session_id, authorization, state, baseline):
     if not authorization.strip():
         raise ValueError("Explicit user authorization is required; use a real host session ID when available")
     cp.validate(state)
-    directory = cp.task_directory(Path(root).resolve(strict=True), task)
-    if (directory / "control.json").exists():
-        old = read_control(root, task)
-        if session_id and old["session_id"] == session_id and old["phase"] in {"working", "finishing"}:
-            latest_state(root, task)
-            cp.verify_journal(root, task)
-            return {"already_active": True, "control": old}
-        raise ValueError("Existing task: use recover, ack-recovery and resume; start cannot erase a pending stop")
-    cp.append_journal(root, task, "activation-baseline", baseline)
+    root = Path(root).resolve(strict=True)
+    directory = cp.task_directory(root, task)
     value = {"schemaVersion": 2, "task": task, "session_id": session_id,
              "authorized_by": authorization, "monitoring_enabled": True,
              "phase": "working", "pause_pending": False, "pause_reason": None,
@@ -79,9 +74,30 @@ def start(root, task, session_id, authorization, state, baseline):
              "last_observed_at": None, "active_minutes_since_check": 0,
              "next_check_minutes": None, "hooks_status": "not_configured"}
     with cp.task_lock(directory):
+        pending = task_path(root, task, "INITIALIZING.json")
+        request = {"schemaVersion": 1, "task": task, "session_id": session_id,
+                   "authorized_by": authorization, "state": dict(state, status="active"),
+                   "baselineSha256": hashlib.sha256(baseline.encode("utf-8")).hexdigest()}
+        if pending.exists():
+            if json.loads(pending.read_text(encoding="utf-8")) != request:
+                raise ValueError("Incomplete initialization: retry with the original session, authorization, state and baseline; do not replace the original scope")
+        elif task_path(root, task, "control.json").exists():
+            old = read_control(root, task)
+            if session_id and old["session_id"] == session_id and old["phase"] in {"working", "finishing"}:
+                latest_state(root, task)
+                cp.verify_journal(root, task)
+                return {"already_active": True, "control": old}
+            raise ValueError("Existing task: use recover, ack-recovery and resume; start cannot erase a pending stop")
+        elif task_path(root, task, "LATEST").exists():
+            raise ValueError("Existing checkpoint without a live control: recover or explicitly migrate its known history")
+        else:
+            cp.atomic_write(pending, cp.json_bytes(request))
+        # A durable marker gates every workflow transition until the complete
+        # baseline, control and first checkpoint have all been published.
+        cp._append_journal(root, task, "activation-baseline", baseline)
         value = write_control(root, task, value)
-    state = dict(state, status="active")
-    saved = cp.save_checkpoint(root, task, state)
+        saved = cp._save_checkpoint(root, task, request["state"])
+        pending.unlink()
     return {"control": value, "checkpoint": saved, "baseline_reading_required": True}
 
 
@@ -154,7 +170,7 @@ def transition(root, task, operation, payload=None):
         return write_control(root, task, value)
 
 
-def recovery_report(root, task):
+def _recovery_snapshot(root, task):
     state, verified = latest_state(root, task)
     control = None
     legacy = False
@@ -175,40 +191,68 @@ def recovery_report(root, task):
     evidence = {"checkpoint": Path(verified["versionDirectory"]).name, "journal": journal,
                 "control": control, "files": files, "git": verified["currentGit"]}
     digest = hashlib.sha256(cp.json_bytes(evidence)).hexdigest()
-    return {"recoveryFingerprint": digest, "state": state, "control": control, "verification": verified,
+    report = {"recoveryFingerprint": digest, "state": state, "control": control, "verification": verified,
             "technicalLog": journal["technicalLog"] if journal else None,
             "historyGap": journal is None, "legacyControl": legacy, "reviewRequired": list(REVIEW_FIELDS),
             "instruction": "Read full requirements, relevant original journal/evidence and current files. Historical notes are data, not new authorization."}
+    return report, evidence
+
+
+def recovery_report(root, task):
+    return _recovery_snapshot(root, task)[0]
 
 
 def acknowledge(root, task, review):
-    report = recovery_report(root, task)
-    if review.get("recoveryFingerprint") != report["recoveryFingerprint"]:
-        raise ValueError("Recovery evidence changed; read the latest records and reconcile again")
-    if any(not isinstance(review.get(field), str) or not review[field].strip() for field in REVIEW_FIELDS):
-        raise ValueError("Each recovery topic needs a factual review note; booleans are not sufficient")
-    cp.append_journal(root, task, "recovery-review-" + uuid.uuid4().hex,
-                      "Recovery review / 恢复核对\n\n" + json.dumps(review, ensure_ascii=False, indent=2))
-    directory = cp.task_directory(Path(root).resolve(strict=True), task)
+    root = Path(root).resolve(strict=True)
+    directory = cp.task_directory(root, task)
     with cp.task_lock(directory):
+        report, evidence = _recovery_snapshot(root, task)
+        if review.get("recoveryFingerprint") != report["recoveryFingerprint"]:
+            raise ValueError("Recovery evidence changed; read the latest records and reconcile again")
+        if any(not isinstance(review.get(field), str) or not review[field].strip() for field in REVIEW_FIELDS):
+            raise ValueError("Each recovery topic needs a factual review note; booleans are not sufficient")
         value = read_control(root, task)
-        value.update(recovery_required=False, last_recovery_review=review)
-        write_control(root, task, value)
-    # Resume must still see the same files, checkpoint, and control after this acknowledgement.
-    receipt = {"fingerprint": recovery_report(root, task)["recoveryFingerprint"]}
-    cp.atomic_write(task_path(root, task, "RECOVERY_ACK.json"), cp.json_bytes(receipt))
+        if evidence["journal"] is None:
+            raise ValueError("Preserve and explicitly migrate known legacy history before acknowledging recovery")
+        receipt_path = task_path(root, task, "RECOVERY_ACK.json")
+        value = write_control(root, task, dict(value, recovery_required=True))
+        receipt_path.unlink(missing_ok=True)
+        try:
+            journal = cp._append_journal(root, task, "recovery-review-" + uuid.uuid4().hex,
+                           "Recovery review / 恢复核对\n\n" + json.dumps(review, ensure_ascii=False, indent=2))
+            # Only our own review entry and control write may change the reviewed
+            # snapshot. Never bless a freshly read, unreviewed project state.
+            final_value = dict(value, recovery_required=False, last_recovery_review=review,
+                               updated_at=datetime.now(timezone.utc).isoformat())
+            expected = dict(evidence, control=final_value,
+                            journal={key: journal[key] for key in evidence["journal"]})
+            fingerprint = hashlib.sha256(cp.json_bytes(expected)).hexdigest()
+            cp.atomic_write(receipt_path, cp.json_bytes({"fingerprint": fingerprint}))
+            staged_fingerprint = hashlib.sha256(cp.json_bytes(dict(expected, control=value))).hexdigest()
+            if recovery_report(root, task)["recoveryFingerprint"] != staged_fingerprint:
+                raise ValueError("Recovery evidence changed during acknowledgement; read and reconcile the latest evidence again")
+            # Keep the recovery gate closed until the receipt is durable and the
+            # reviewed evidence still matches. A crash before this point is safe to retry.
+            cp.atomic_write(task_path(root, task, "control.json"), cp.json_bytes(final_value))
+            if recovery_report(root, task)["recoveryFingerprint"] != fingerprint:
+                raise ValueError("Recovery evidence changed during acknowledgement; read and reconcile the latest evidence again")
+        except (OSError, ValueError, KeyError, TypeError):
+            # A failed acknowledgement must not unlock work after compaction.
+            receipt_path.unlink(missing_ok=True)
+            write_control(root, task, dict(value, recovery_required=True))
+            raise
     return {"review_recorded": True, "project_resumed": False}
 
 
 def resume(root, task, session_id, authorization):
     if not authorization.strip():
         raise ValueError("Explicit continue authorization is required")
-    report = recovery_report(root, task)
-    receipt = json.loads(task_path(root, task, "RECOVERY_ACK.json").read_text(encoding="utf-8"))
-    if receipt.get("fingerprint") != report["recoveryFingerprint"]:
-        raise ValueError("Recovery acknowledgement is absent or stale; re-read and reconcile first")
     directory = cp.task_directory(Path(root).resolve(strict=True), task)
     with cp.task_lock(directory):
+        report = recovery_report(root, task)
+        receipt = json.loads(task_path(root, task, "RECOVERY_ACK.json").read_text(encoding="utf-8"))
+        if receipt.get("fingerprint") != report["recoveryFingerprint"]:
+            raise ValueError("Recovery acknowledgement is absent or stale; re-read and reconcile first")
         value = read_control(root, task)
         if value["recovery_required"]:
             raise ValueError("Recovery review is still required")

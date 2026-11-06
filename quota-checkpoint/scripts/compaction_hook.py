@@ -29,8 +29,9 @@ def find_bound_task(cwd, session_id):
             except (OSError, ValueError):
                 continue  # Unbound/unknown records must not activate another session.
             if isinstance(raw, dict) and raw.get("session_id") == session_id:
-                wf.read_control(root, directory.name)
-                candidates.append((root, directory.name))
+                control = wf.read_control(root, directory.name)
+                if control["phase"] != "completed":
+                    candidates.append((root, directory.name))
         if (root / ".git").exists():
             break
     if len(candidates) > 1:
